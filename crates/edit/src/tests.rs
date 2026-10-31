@@ -5219,9 +5219,61 @@ fn arabic_actual_text_keeps_typing_order_when_opened_for_editing() {
                 assert_eq!(lines.len(), 1);
                 assert_eq!(lines[0].text, logical, "ActualText is already in typing order");
                 assert_eq!(text::text_blocks(doc, 0).unwrap()[0].editor_text, logical);
+                assert_eq!(reading_blocks_checked(doc, 0).unwrap().blocks[0].text, logical, "export keeps authoritative ActualText");
             }
         }
     }
+}
+
+#[test]
+fn reading_rtl_lines_keep_the_same_logical_order_as_editing() {
+    let arabic = arabic_ligature_page("BT /F1 12 Tf 72 700 Td (B A) Tj ET", false);
+    let hebrew = hebrew_page("BT /F1 12 Tf 72 700 Td (EDCBA) Tj ET");
+    let latin = text_page("BT /F1 12 Tf 72 700 Td (Invoice 123 PDF) Tj ET");
+    for (doc, expected) in [(arabic, "س م"), (hebrew, "בדיוק"), (latin, "Invoice 123 PDF")] {
+        for doc in [&doc, &reopen(&doc)] {
+            assert_eq!(text_lines(doc, 0).unwrap()[0].text, expected, "existing editor behavior");
+            let reading = reading_blocks_checked(doc, 0).unwrap();
+            assert!(!reading.truncated);
+            assert_eq!(reading.blocks[0].text, expected, "Office export must receive logical text too");
+            assert_eq!(reading.blocks[0].editor_text, expected);
+        }
+    }
+}
+
+#[test]
+fn empty_unicode_auxiliaries_do_not_invent_word_spaces() {
+    for auxiliary_x in [54.0, 37.0] {
+        let mut doc =
+            text_page(&format!("BT /F1 12 Tf 1 0 0 1 40 700 Tm (A) Tj 1 0 0 1 {auxiliary_x} 700 Tm (B) Tj 1 0 0 1 48.004 700 Tm (C) Tj ET"));
+        let cmap = doc.add(Object::Stream(Stream::flate(
+            Dict::new(),
+            b"begincmap 1 begincodespacerange <00> <FF> endcodespacerange 3 beginbfchar <41> <0061> <42> <> <43> <0062> endbfchar endcmap",
+        )));
+        // text_page's F1 is object 5. B stands for a separately painted auxiliary
+        // with explicitly empty Unicode; only A and C contribute semantic text.
+        doc.update_dict(pdfcraft_cos::ObjRef::new(5, 0), |f| f.set(b"ToUnicode".to_vec(), Object::Ref(cmap))).unwrap();
+        let lines = text_lines(&doc, 0).unwrap();
+        assert_eq!(lines[0].text, "ab");
+        assert_eq!(reading_blocks_checked(&doc, 0).unwrap().blocks[0].text, "ab");
+        clear_block(&mut doc, 0, 0).unwrap();
+        assert!(!streams(&doc, 0).join("\n").contains("(B)"), "an edit still removes the auxiliary drawing");
+    }
+}
+
+#[test]
+fn leading_empty_unicode_auxiliaries_stay_with_their_new_line() {
+    let mut doc = text_page("BT /F1 12 Tf 1 0 0 1 40 700 Tm (A) Tj 1 0 0 1 40 670 Tm (B) Tj 1 0 0 1 48.004 670 Tm (C) Tj ET");
+    let cmap = doc.add(Object::Stream(Stream::flate(
+        Dict::new(),
+        b"begincmap 1 begincodespacerange <00> <FF> endcodespacerange 3 beginbfchar <41> <0061> <42> <> <43> <0062> endbfchar endcmap",
+    )));
+    doc.update_dict(pdfcraft_cos::ObjRef::new(5, 0), |f| f.set(b"ToUnicode".to_vec(), Object::Ref(cmap))).unwrap();
+    let lines = text_lines(&doc, 0).unwrap();
+    assert_eq!(lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    let block = text::text_blocks(&doc, 0).unwrap().iter().position(|block| block.text.contains('b')).unwrap();
+    clear_block(&mut doc, 0, block).unwrap();
+    assert!(!streams(&doc, 0).join("\n").contains("(B)"), "the new line retains its leading auxiliary operator");
 }
 
 #[test]

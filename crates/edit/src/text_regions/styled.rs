@@ -54,18 +54,21 @@ impl FontResolver<'_> {
         }) {
             return Ok(Some(name.clone()));
         }
-        if let Some(face) =
-            pdfcraft_fonts::embedding::matching_faces(&source.base_font).into_iter().find(|face| pdfcraft_fonts::embedding::covers(face.bytes, text))
-        {
-            return self.embed_face(face.name(), face.bytes, face.family, "the full source font could not be loaded").map(Some);
-        }
-        let Some(bytes) = self
+        // A complete, licensed embedded program preserves the document's face. Consult
+        // optional matching fonts only when that source cannot cover the character.
+        let bytes = self
             .programs
             .entry(source.font.clone())
             .or_insert_with(|| source_program(self.doc, self.fonts, &source.font).map(std::sync::Arc::new))
             .clone()
-            .filter(|bytes| pdfcraft_fonts::embedding::covers(bytes, text))
-        else {
+            .filter(|bytes| pdfcraft_fonts::embedding::covers(bytes, text));
+        let Some(bytes) = bytes else {
+            if let Some(face) = pdfcraft_fonts::embedding::matching_faces(&source.base_font)
+                .into_iter()
+                .find(|face| pdfcraft_fonts::embedding::covers(face.bytes, text))
+            {
+                return self.embed_face(face.name(), face.bytes, face.family, "the full source font could not be loaded").map(Some);
+            }
             return Ok(None);
         };
         let key = format!("source {}", source.font);
@@ -153,6 +156,22 @@ impl CharacterPreparation<'_> {
                     name
                 };
                 chars.push((ch, index, name));
+            }
+        }
+        // If missing characters required the complete source program, use that resource
+        // consistently for this source span. Mixing its old partial PDF encoding with
+        // the full encoding would split a contextual row even though the face is identical.
+        if pdfcraft_fonts::source_shaping::required(draft) {
+            for (ch, index, resource) in &mut chars {
+                let source = lines.get(*index).unwrap_or(first);
+                if resource != &source.font || style.resource.is_some() || overrides.get(index).is_some_and(|range| range.resource.is_some()) {
+                    continue;
+                }
+                if let Some(name) = resolver.full_faces.get(&format!("source {}", source.font))
+                    && resolver.metrics.get(name).is_some_and(|metrics| source_encodes(metrics, &ch.to_string()))
+                {
+                    *resource = name.clone();
+                }
             }
         }
         drop(resolver);
@@ -270,7 +289,7 @@ fn prepare_shaped_rows(
 fn embed_shaped_resources(doc: &mut Document, fonts: &mut Dict, runs: &ShapedRunCache) -> Result<HashMap<(usize, usize), String>, EditError> {
     let mut resources = HashMap::new();
     for (key, (bytes, shaped, family)) in runs {
-        let mappings: Vec<_> = shaped.glyphs.iter().map(|glyph| (glyph.text.clone(), glyph.id)).collect();
+        let mappings = shaped.pdf_mappings(bytes).map_err(EditError::Invalid)?;
         let resource = pdfcraft_fonts::embedding::embed_mapping(doc, fonts, bytes, family, &mappings).map_err(EditError::Invalid)?;
         resources.insert(*key, resource);
     }

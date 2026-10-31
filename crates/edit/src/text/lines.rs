@@ -238,7 +238,11 @@ fn text_lines_in(doc: &Document, p: &pdfcraft_model::Page, actual_text: bool) ->
         });
         if joins && let Some(l) = lines.last_mut() {
             let gap = last.map_or(0.0, |(_, pen)| pen.continues(&s, 0.0).1);
-            let spaced = gap - s.tracking > l.size * s.state.scale.abs() * 0.2 && !l.text.ends_with(' ') && !s.text.starts_with(' ');
+            let spaced = !s.text.is_empty()
+                && !l.text.is_empty()
+                && gap - s.tracking > l.size * s.state.scale.abs() * 0.2
+                && !l.text.ends_with(' ')
+                && !s.text.starts_with(' ');
             if spaced {
                 l.text.push(' ');
             }
@@ -297,9 +301,23 @@ fn text_lines_in(doc: &Document, p: &pdfcraft_model::Page, actual_text: bool) ->
                 },
             });
         }
-        last = Some((si, Pen::after(&s)));
+        // An empty ToUnicode auxiliary can be positioned behind its letter. It
+        // contributes ink/operators, but must not move the semantic pen backwards
+        // and invent a word gap before the next letter. Keep a leading auxiliary
+        // joinable so replacing the line still removes its drawing too.
+        if !s.text.is_empty() || !joins || last.is_none() {
+            last = Some((si, Pen::after(&s)));
+        }
     }
-    // Content streams draw right-to-left lines in visual order; the editor works in typing order.
+    recover_logical_order(&mut lines);
+    // Lines of only spaces aren't editable text.
+    lines.retain(|l| !l.text.trim().is_empty());
+    Ok(lines)
+}
+
+/// Both the editor and the read-only export/form reader need the same logical Unicode.
+/// Explicit logical replacements must not be passed through visual-order recovery again.
+fn recover_logical_order(lines: &mut [TextLine]) {
     for l in lines.iter_mut().filter(|l| !l.logical_order) {
         // A visual-order Indic font draws pre-base vowel signs before their consonant.
         let shown = l.text.clone();
@@ -312,9 +330,6 @@ fn text_lines_in(doc: &Document, p: &pdfcraft_model::Page, actual_text: bool) ->
             l.runs.clear();
         }
     }
-    // Lines of only spaces aren't editable text.
-    lines.retain(|l| !l.text.trim().is_empty());
-    Ok(lines)
 }
 
 /// Joining independent text objects is safe only when they use the same text and graphics
@@ -356,7 +371,11 @@ fn add_shown(lines: &mut Vec<TextLine>, last: &mut Option<Pen>, s: Shown, stream
     });
     if joins && let Some(l) = lines.last_mut() {
         let gap = last.map_or(0.0, |pen| pen.continues(&s, 0.0).1);
-        let spaced = gap - s.tracking > l.size * s.state.scale.abs() * 0.2 && !l.text.ends_with(' ') && !s.text.starts_with(' ');
+        let spaced = !s.text.is_empty()
+            && !l.text.is_empty()
+            && gap - s.tracking > l.size * s.state.scale.abs() * 0.2
+            && !l.text.ends_with(' ')
+            && !s.text.starts_with(' ');
         if spaced {
             l.text.push(' ');
         }
@@ -414,7 +433,9 @@ fn add_shown(lines: &mut Vec<TextLine>, last: &mut Option<Pen>, s: Shown, stream
             },
         });
     }
-    *last = Some(Pen::after(&s));
+    if !s.text.is_empty() || !joins || last.is_none() {
+        *last = Some(Pen::after(&s));
+    }
 }
 
 /// How deep form XObjects nest before reading stops (they may also refer to themselves). The
@@ -578,14 +599,7 @@ pub(super) fn reading_lines(doc: &Document, page: usize) -> Result<(Vec<TextLine
     let stream_of = |i: usize| ops.get(i).map_or(0, |op| pieces.pieces_of(op).0);
     walk(&mut w, &ops, &res, &mut carry, &stream_of)?;
     let mut lines = w.lines;
-    // A visual-order Indic font draws pre-base vowel signs before their consonant.
-    for l in lines.iter_mut().filter(|l| l.visual_order && !l.actual_text) {
-        let shown = l.text.clone();
-        l.text = crate::indic::to_logical(&l.text);
-        if l.text != shown {
-            l.runs.clear();
-        }
-    }
+    recover_logical_order(&mut lines);
     lines.retain(|l| !l.text.trim().is_empty());
     Ok((lines, w.budget.truncated))
 }
